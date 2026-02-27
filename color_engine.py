@@ -242,6 +242,55 @@ def auto_adjust_for_print(
     return adjusted_rgb, adjusted_sim, adjusted_de
 
 
+def _build_lut(control_points: list[tuple[int, int]]) -> np.ndarray:
+    """
+    コントロールポイントからスプライン補間で256エントリのLUTを作成。
+    control_points: [(input, output), ...] 0-255の範囲
+    """
+    # 始点と終点を保証
+    points = sorted(control_points, key=lambda p: p[0])
+    if points[0][0] != 0:
+        points.insert(0, (0, 0))
+    if points[-1][0] != 255:
+        points.append((255, 255))
+
+    xs = np.array([p[0] for p in points], dtype=np.float64)
+    ys = np.array([p[1] for p in points], dtype=np.float64)
+
+    # 全入力値(0-255)に対して補間
+    all_x = np.arange(256, dtype=np.float64)
+    lut = np.interp(all_x, xs, ys)
+    return np.clip(lut, 0, 255).astype(np.uint8)
+
+
+def apply_tone_curves(
+    image: Image.Image,
+    r_points: list[tuple[int, int]] | None = None,
+    g_points: list[tuple[int, int]] | None = None,
+    b_points: list[tuple[int, int]] | None = None,
+) -> Image.Image:
+    """
+    RGB各チャンネルにトーンカーブ(LUT)を適用する。
+
+    各チャンネルのcontrol_points: [(input, output), ...]
+    Noneの場合はそのチャンネルは変更なし（リニア）。
+    """
+    image = image.convert("RGB")
+    arr = np.array(image)
+
+    identity = [(0, 0), (255, 255)]
+
+    r_lut = _build_lut(r_points if r_points else identity)
+    g_lut = _build_lut(g_points if g_points else identity)
+    b_lut = _build_lut(b_points if b_points else identity)
+
+    arr[:, :, 0] = r_lut[arr[:, :, 0]]
+    arr[:, :, 1] = g_lut[arr[:, :, 1]]
+    arr[:, :, 2] = b_lut[arr[:, :, 2]]
+
+    return Image.fromarray(arr)
+
+
 def export_cmyk(
     image: Image.Image,
     cmyk_profile_path: Path,

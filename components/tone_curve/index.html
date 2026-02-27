@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html>
+<head>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: transparent; font-family: -apple-system, sans-serif; padding: 4px; }
+  .toolbar {
+    display: flex; gap: 4px; margin-bottom: 6px; align-items: center;
+  }
+  .ch-btn {
+    padding: 3px 14px; border: none; border-radius: 4px; cursor: pointer;
+    font-size: 12px; font-weight: 600; opacity: 0.4; transition: opacity 0.15s;
+  }
+  .ch-btn.active { opacity: 1; }
+  .ch-btn.r { background: #ff4444; color: white; }
+  .ch-btn.g { background: #44aa44; color: white; }
+  .ch-btn.b { background: #4444ff; color: white; }
+  .reset-btn {
+    margin-left: auto; padding: 3px 10px; border: 1px solid #555;
+    border-radius: 4px; cursor: pointer; background: #2a2a3e; color: #aaa;
+    font-size: 11px; transition: background 0.15s;
+  }
+  .reset-btn:hover { background: #3a3a4e; }
+  canvas { border-radius: 4px; cursor: crosshair; display: block; }
+  .info {
+    font-size: 11px; color: #888; margin-top: 4px; height: 16px;
+  }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <button class="ch-btn r active" onclick="selectChannel('r')">R</button>
+  <button class="ch-btn g" onclick="selectChannel('g')">G</button>
+  <button class="ch-btn b" onclick="selectChannel('b')">B</button>
+  <button class="reset-btn" onclick="resetAll()">Reset</button>
+</div>
+<canvas id="curve"></canvas>
+<div class="info" id="info"></div>
+
+<script>
+// --- Streamlit Component Communication ---
+function sendMessageToStreamlit(type, data) {
+  const outData = Object.assign({
+    isStreamlitMessage: true,
+    type: type,
+  }, data);
+  window.parent.postMessage(outData, "*");
+}
+
+function setComponentValue(value) {
+  sendMessageToStreamlit("streamlit:setComponentValue", { value: value });
+}
+
+function setFrameHeight(height) {
+  sendMessageToStreamlit("streamlit:setFrameHeight", { height: height });
+}
+
+function componentReady() {
+  sendMessageToStreamlit("streamlit:componentReady", { apiVersion: 1 });
+}
+
+// --- Tone Curve Logic ---
+const FIXED_X = [0, 64, 128, 192, 255];
+const POINT_LABELS = ['Black', 'Shadow', 'Mid', 'Highlight', 'White'];
+
+let SIZE = 280;
+const PAD = 24;
+let PLOT;
+
+let channelPoints = {
+  r: FIXED_X.map(x => [x, x]),
+  g: FIXED_X.map(x => [x, x]),
+  b: FIXED_X.map(x => [x, x]),
+};
+
+let activeChannel = 'r';
+let dragIndex = -1;
+let isDragging = false;
+let hoverIndex = -1;
+
+const canvas = document.getElementById('curve');
+const ctx = canvas.getContext('2d');
+const info = document.getElementById('info');
+
+const COLORS = { r: '#ff4444', g: '#44aa44', b: '#4444ff' };
+const COLORS_DIM = { r: 'rgba(255,68,68,0.3)', g: 'rgba(68,170,68,0.3)', b: 'rgba(68,68,255,0.3)' };
+
+function initSize() {
+  const w = Math.min(document.body.clientWidth - 8, 320);
+  SIZE = w;
+  PLOT = SIZE - PAD * 2;
+  canvas.width = SIZE;
+  canvas.height = SIZE;
+}
+
+function v2cx(v) { return PAD + (v / 255) * PLOT; }
+function v2cy(v) { return SIZE - PAD - (v / 255) * PLOT; }
+function cy2v(y) { return Math.round(Math.max(0, Math.min(255, ((SIZE - PAD - y) / PLOT) * 255))); }
+
+function lerp(points) {
+  const s = [...points].sort((a, b) => a[0] - b[0]);
+  const lut = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let lo = s[0], hi = s[s.length - 1];
+    for (let j = 0; j < s.length - 1; j++) {
+      if (s[j][0] <= i && s[j + 1][0] >= i) { lo = s[j]; hi = s[j + 1]; break; }
+    }
+    lut[i] = lo[0] === hi[0] ? lo[1] : lo[1] + (i - lo[0]) / (hi[0] - lo[0]) * (hi[1] - lo[1]);
+  }
+  return lut;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, SIZE, SIZE);
+
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, SIZE, SIZE);
+
+  // Grid
+  ctx.strokeStyle = '#2a2a40';
+  ctx.lineWidth = 0.5;
+  for (let i = 0; i <= 4; i++) {
+    const x = PAD + (i / 4) * PLOT;
+    const y = PAD + (i / 4) * PLOT;
+    ctx.beginPath(); ctx.moveTo(x, PAD); ctx.lineTo(x, SIZE - PAD); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(PAD, y); ctx.lineTo(SIZE - PAD, y); ctx.stroke();
+  }
+
+  // Diagonal
+  ctx.strokeStyle = '#444';
+  ctx.lineWidth = 1;
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(v2cx(0), v2cy(0));
+  ctx.lineTo(v2cx(255), v2cy(255));
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // Curves: inactive first, active last
+  const order = ['r', 'g', 'b'].filter(c => c !== activeChannel);
+  order.push(activeChannel);
+
+  for (const ch of order) {
+    const active = ch === activeChannel;
+    const color = active ? COLORS[ch] : COLORS_DIM[ch];
+    const lut = lerp(channelPoints[ch]);
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = active ? 2 : 1.2;
+    ctx.beginPath();
+    for (let i = 0; i < 256; i++) {
+      const x = v2cx(i), y = v2cy(lut[i]);
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    if (active) {
+      const pts = channelPoints[ch];
+      for (let i = 0; i < pts.length; i++) {
+        const cx = v2cx(pts[i][0]), cy = v2cy(pts[i][1]);
+        const isHover = (i === hoverIndex || i === dragIndex);
+        const r = isHover ? 7 : 5;
+
+        ctx.fillStyle = color;
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+
+        ctx.strokeStyle = isHover ? '#fff' : 'rgba(255,255,255,0.6)';
+        ctx.lineWidth = isHover ? 2 : 1;
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      }
+    }
+  }
+
+  // Axis labels
+  ctx.fillStyle = '#666';
+  ctx.font = '9px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('0', v2cx(0), SIZE - 6);
+  ctx.fillText('128', v2cx(128), SIZE - 6);
+  ctx.fillText('255', v2cx(255), SIZE - 6);
+  ctx.textAlign = 'right';
+  ctx.fillText('0', PAD - 4, v2cy(0) + 3);
+  ctx.fillText('255', PAD - 4, v2cy(255) + 3);
+}
+
+function findPoint(mx, my) {
+  const pts = channelPoints[activeChannel];
+  let best = -1, bestDist = 20;
+  for (let i = 0; i < pts.length; i++) {
+    const d = Math.hypot(mx - v2cx(pts[i][0]), my - v2cy(pts[i][1]));
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  return best;
+}
+
+function getPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  const t = e.touches ? e.touches[0] || e.changedTouches[0] : e;
+  return [t.clientX - rect.left, t.clientY - rect.top];
+}
+
+canvas.addEventListener('mousedown', (e) => {
+  const [mx, my] = getPos(e);
+  dragIndex = findPoint(mx, my);
+  if (dragIndex >= 0) {
+    isDragging = true;
+    canvas.style.cursor = 'grabbing';
+  }
+});
+
+canvas.addEventListener('mousemove', (e) => {
+  const [mx, my] = getPos(e);
+  if (isDragging && dragIndex >= 0) {
+    channelPoints[activeChannel][dragIndex][1] = cy2v(my);
+    const p = channelPoints[activeChannel][dragIndex];
+    info.textContent = POINT_LABELS[dragIndex] + ': ' + p[0] + ' → ' + p[1];
+    draw();
+  } else {
+    const hi = findPoint(mx, my);
+    if (hi !== hoverIndex) {
+      hoverIndex = hi;
+      canvas.style.cursor = hi >= 0 ? 'grab' : 'crosshair';
+      if (hi >= 0) {
+        const p = channelPoints[activeChannel][hi];
+        info.textContent = POINT_LABELS[hi] + ': ' + p[0] + ' → ' + p[1];
+      } else {
+        info.textContent = '';
+      }
+      draw();
+    }
+  }
+});
+
+canvas.addEventListener('mouseup', () => {
+  if (isDragging) {
+    isDragging = false;
+    dragIndex = -1;
+    canvas.style.cursor = 'crosshair';
+    sendValue();
+  }
+});
+
+canvas.addEventListener('mouseleave', () => {
+  if (isDragging) {
+    isDragging = false;
+    dragIndex = -1;
+    canvas.style.cursor = 'crosshair';
+    sendValue();
+  }
+  hoverIndex = -1;
+  info.textContent = '';
+  draw();
+});
+
+// Touch support
+canvas.addEventListener('touchstart', function(e) {
+  e.preventDefault();
+  var pos = getPos(e);
+  dragIndex = findPoint(pos[0], pos[1]);
+  if (dragIndex >= 0) isDragging = true;
+}, { passive: false });
+
+canvas.addEventListener('touchmove', function(e) {
+  e.preventDefault();
+  if (!isDragging || dragIndex < 0) return;
+  var pos = getPos(e);
+  channelPoints[activeChannel][dragIndex][1] = cy2v(pos[1]);
+  draw();
+}, { passive: false });
+
+canvas.addEventListener('touchend', function(e) {
+  e.preventDefault();
+  if (isDragging) {
+    isDragging = false;
+    dragIndex = -1;
+    sendValue();
+  }
+}, { passive: false });
+
+function selectChannel(ch) {
+  activeChannel = ch;
+  document.querySelectorAll('.ch-btn').forEach(function(btn) {
+    btn.classList.toggle('active', btn.classList.contains(ch));
+  });
+  hoverIndex = -1;
+  info.textContent = '';
+  draw();
+}
+
+function resetAll() {
+  channelPoints = {
+    r: FIXED_X.map(function(x) { return [x, x]; }),
+    g: FIXED_X.map(function(x) { return [x, x]; }),
+    b: FIXED_X.map(function(x) { return [x, x]; }),
+  };
+  draw();
+  sendValue();
+}
+
+function sendValue() {
+  var value = {
+    r: channelPoints.r.map(function(p) { return [p[0], p[1]]; }),
+    g: channelPoints.g.map(function(p) { return [p[0], p[1]]; }),
+    b: channelPoints.b.map(function(p) { return [p[0], p[1]]; }),
+  };
+  setComponentValue(value);
+}
+
+// --- Initialize ---
+function onRender(event) {
+  if (event.data.type !== "streamlit:render") return;
+  var args = event.data.args;
+  if (args && args.channel_points) {
+    channelPoints = {
+      r: args.channel_points.r.map(function(p) { return [p[0], p[1]]; }),
+      g: args.channel_points.g.map(function(p) { return [p[0], p[1]]; }),
+      b: args.channel_points.b.map(function(p) { return [p[0], p[1]]; }),
+    };
+  }
+  initSize();
+  draw();
+  setFrameHeight(document.body.scrollHeight);
+}
+
+window.addEventListener("message", onRender);
+initSize();
+draw();
+componentReady();
+setFrameHeight(document.body.scrollHeight);
+</script>
+</body>
+</html>
