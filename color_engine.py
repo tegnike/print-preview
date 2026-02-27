@@ -178,57 +178,66 @@ def auto_adjust_for_print(
     strength: float = 1.0,
 ) -> tuple[Image.Image, Image.Image, np.ndarray]:
     """
-    色域外のピクセルの彩度を自動調整してCMYK色域内に収める。
+    逆補正アプローチで印刷後の色をオリジナルに近づける。
 
     仕組み:
-    1. ソフトプルーフで「CMYK変換後の色」を取得
-    2. 色域外のピクセルを特定（DeltaEが高い箇所）
-    3. そのピクセルの彩度をHSV空間で段階的に下げ、DeltaEが許容範囲に入るまで繰り返す
-    4. 調整済みRGB画像を返す
+    1. ソフトプルーフで「CMYK変換すると色がどうズレるか」を計算
+    2. そのズレの逆方向にあらかじめ色を補正（逆補正）
+    3. 反復しながら、ピクセルごとに「改善する場合のみ補正を採用」
+    4. 補正した画像をCMYK変換すると、元の色に近くなる
 
     Returns: (adjusted_rgb, adjusted_simulated, adjusted_delta_e)
     """
     image = image.convert("RGB")
-    orig_arr = np.array(image)
+    orig_arr = np.array(image, dtype=np.float64)
 
-    # ソフトプルーフで色域外を把握
-    simulated = soft_proof(image, cmyk_profile_path, intent_name)
-    delta_e = compute_delta_e(image, simulated)
+    # オリジナルのLab（比較基準）
+    orig_lab = _srgb_to_lab(np.array(image))
 
-    # HSV変換
-    hsv_image = image.convert("HSV")
-    hsv_arr = np.array(hsv_image, dtype=np.float64)
+    # 最良結果を追跡
+    best_arr = orig_arr.copy()
+    best_sim = soft_proof(image, cmyk_profile_path, intent_name)
+    best_de = compute_delta_e(image, best_sim)
 
-    # DeltaEが高いピクセルほど彩度を下げる
-    # 閾値3.0以上を色域外とみなす
-    gamut_threshold = 3.0
-    out_of_gamut = delta_e > gamut_threshold
+    adjusted_arr = orig_arr.copy()
 
-    if not np.any(out_of_gamut):
-        # 調整不要
-        return image, simulated, delta_e
+    # 反復逆補正（3回固定、減衰あり）
+    for i in range(3):
+        damping = strength * (0.8 ** i)  # 反復ごとに減衰
 
-    # DeltaEに基づいて彩度の削減率を計算
-    # DeltaEが大きいほど彩度を大きく下げる
-    max_de = delta_e.max()
-    if max_de > gamut_threshold:
-        # 0.0（変更なし）〜 1.0（最大削減）にスケーリング
-        reduction = np.clip(
-            (delta_e - gamut_threshold) / (max_de - gamut_threshold), 0.0, 1.0
+        current_img = Image.fromarray(
+            np.clip(adjusted_arr, 0, 255).astype(np.uint8)
         )
-        reduction *= strength  # ユーザー指定の強度
+        current_sim = soft_proof(current_img, cmyk_profile_path, intent_name)
+        sim_arr = np.array(current_sim, dtype=np.float64)
 
-        # 彩度チャンネル（index=1）を削減
-        new_saturation = hsv_arr[:, :, 1] * (1.0 - reduction * 0.7)  # 最大70%削減
-        hsv_arr[:, :, 1] = np.clip(new_saturation, 0, 255)
+        # ズレ = オリジナル - 現在のシミュレーション結果
+        error = orig_arr - sim_arr
 
-    # HSV→RGB に戻す
-    adjusted_hsv = Image.fromarray(hsv_arr.astype(np.uint8), "HSV")
-    adjusted_rgb = adjusted_hsv.convert("RGB")
+        # 逆補正を加算
+        candidate_arr = np.clip(adjusted_arr + error * damping, 0, 255)
 
-    # 調整後のシミュレーションとDeltaEを計算
+        # 候補をソフトプルーフして効果を検証
+        candidate_img = Image.fromarray(candidate_arr.astype(np.uint8))
+        candidate_sim = soft_proof(candidate_img, cmyk_profile_path, intent_name)
+
+        # ピクセルごとにDeltaEを比較して、改善した場合のみ採用
+        candidate_sim_lab = _srgb_to_lab(np.array(candidate_sim))
+        candidate_de = np.sqrt(np.sum((orig_lab - candidate_sim_lab) ** 2, axis=2))
+
+        improved = candidate_de < best_de
+        improved_3d = improved[:, :, np.newaxis]
+
+        # 改善したピクセルだけ更新
+        best_arr = np.where(improved_3d, candidate_arr, best_arr)
+        best_de = np.minimum(best_de, candidate_de)
+        adjusted_arr = np.where(improved_3d, candidate_arr, adjusted_arr)
+
+    adjusted_rgb = Image.fromarray(
+        np.clip(best_arr, 0, 255).astype(np.uint8)
+    )
     adjusted_sim = soft_proof(adjusted_rgb, cmyk_profile_path, intent_name)
-    adjusted_de = compute_delta_e(adjusted_rgb, adjusted_sim)
+    adjusted_de = compute_delta_e(image, adjusted_sim)
 
     return adjusted_rgb, adjusted_sim, adjusted_de
 
