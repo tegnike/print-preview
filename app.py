@@ -212,27 +212,32 @@ with tab_adjust:
         "\u305d\u306e\u30d5\u30a1\u30a4\u30eb\u3092\u5370\u5237\u5165\u7a3f\u3059\u308c\u3070\u3001\u53f3\u306e\u30b7\u30df\u30e5\u30ec\u30fc\u30b7\u30e7\u30f3\u306b\u8fd1\u3044\u8272\u3067\u5370\u5237\u3055\u308c\u307e\u3059\u3002"
     )
 
-    # 調整済みRGBダウンロード
-    import io
-    buf = io.BytesIO()
-    # オリジナルサイズで調整を実行
-    if adjust_strength > 0:
-        with st.spinner("\u30aa\u30ea\u30b8\u30ca\u30eb\u30b5\u30a4\u30ba\u3067\u8abf\u6574\u4e2d..."):
+    # 調整済みRGBダウンロード（ボタンを押した時だけオリジナルサイズで処理）
+    base_name = uploaded_file.name.rsplit(".", 1)[0]
+
+    if st.button("\U0001f504 \u30aa\u30ea\u30b8\u30ca\u30eb\u30b5\u30a4\u30ba\u3067\u8abf\u6574\u3092\u5b9f\u884c", type="secondary"):
+        import io
+        with st.spinner(
+            f"\u30aa\u30ea\u30b8\u30ca\u30eb\u30b5\u30a4\u30ba ({original_rgb.size[0]}x{original_rgb.size[1]}) \u3067\u8abf\u6574\u4e2d..."
+        ):
             full_adjusted, _, _ = auto_adjust_for_print(
                 original_rgb, cmyk_profile_path, intent_name, adjust_strength
             )
+            buf = io.BytesIO()
             full_adjusted.save(buf, format="PNG")
-    else:
-        original_rgb.save(buf, format="PNG")
+            st.session_state["adjusted_data"] = buf.getvalue()
+            st.session_state["adjusted_filename"] = f"{base_name}_adjusted.png"
+        st.success("\u5909\u63db\u5b8c\u4e86\uff01\u4e0b\u306e\u30dc\u30bf\u30f3\u304b\u3089\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9\u3067\u304d\u307e\u3059\u3002")
+        st.rerun()
 
-    base_name = uploaded_file.name.rsplit(".", 1)[0]
-    st.download_button(
-        label=f"\u2b07\ufe0f {base_name}_adjusted.png \u3092\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9",
-        data=buf.getvalue(),
-        file_name=f"{base_name}_adjusted.png",
-        mime="image/png",
-        type="primary",
-    )
+    if "adjusted_data" in st.session_state:
+        st.download_button(
+            label=f"\u2b07\ufe0f {st.session_state.get('adjusted_filename', base_name + '_adjusted.png')} \u3092\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9",
+            data=st.session_state["adjusted_data"],
+            file_name=st.session_state.get("adjusted_filename", f"{base_name}_adjusted.png"),
+            mime="image/png",
+            type="primary",
+        )
 
 with tab_export:
     st.subheader("CMYK\u753b\u50cf\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9")
