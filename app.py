@@ -10,6 +10,7 @@ from PIL import Image
 
 from color_engine import (
     INTENTS,
+    auto_adjust_for_print,
     compute_delta_e,
     compute_warning_stats,
     create_warning_overlay,
@@ -97,8 +98,8 @@ with st.spinner("\u30bd\u30d5\u30c8\u30d7\u30eb\u30fc\u30d5\u3092\u8a08\u7b97\u4
     simulated = soft_proof(preview_rgb, cmyk_profile_path, intent_name)
 
 # タブ
-tab_compare, tab_warning, tab_export = st.tabs([
-    "\U0001f50d \u6bd4\u8f03", "\u26a0\ufe0f \u8272\u8b66\u544a", "\U0001f4e5 \u30a8\u30af\u30b9\u30dd\u30fc\u30c8"
+tab_compare, tab_warning, tab_adjust, tab_export = st.tabs([
+    "\U0001f50d \u6bd4\u8f03", "\u26a0\ufe0f \u8272\u8b66\u544a", "\U0001f527 \u8272\u8abf\u6574", "\U0001f4e5 \u30a8\u30af\u30b9\u30dd\u30fc\u30c8"
 ])
 
 with tab_compare:
@@ -145,6 +146,92 @@ with tab_warning:
 
     > DeltaE 3\u4ee5\u4e0b: \u307b\u307c\u6c17\u3065\u304b\u306a\u3044\u5dee / 3\uff5e5: \u6ce8\u610f\u6df1\u304f\u898b\u308b\u3068\u308f\u304b\u308b / 5\u4ee5\u4e0a: \u660e\u3089\u304b\u306b\u9055\u3046
     """
+    )
+
+with tab_adjust:
+    st.subheader("\u8272\u57df\u5916\u30ab\u30e9\u30fc\u306e\u81ea\u52d5\u8abf\u6574")
+    st.markdown(
+        "CMYK\u3067\u518d\u73fe\u3067\u304d\u306a\u3044\u9bae\u3084\u304b\u306a\u8272\u306e**\u5f69\u5ea6\u3092\u81ea\u52d5\u3067\u4e0b\u3052\u3066**\u3001"
+        "\u5370\u5237\u3067\u8272\u304c\u5d29\u308c\u306b\u304f\u3044RGB\u753b\u50cf\u3092\u4f5c\u6210\u3057\u307e\u3059\u3002"
+    )
+
+    adjust_strength = st.slider(
+        "\u8abf\u6574\u306e\u5f37\u3055",
+        min_value=0.0,
+        max_value=1.0,
+        value=0.7,
+        step=0.1,
+        help="0.0=\u5909\u66f4\u306a\u3057\u3001 1.0=\u6700\u5927\u9650\u8abf\u6574\u3002\u5f37\u3044\u307b\u3069\u8272\u57df\u5185\u306b\u53ce\u307e\u308b\u304c\u3001\u5f69\u5ea6\u304c\u843d\u3061\u308b\u3002",
+    )
+
+    with st.spinner("\u8272\u8abf\u6574\u4e2d..."):
+        adjusted_rgb, adjusted_sim, adjusted_de = auto_adjust_for_print(
+            preview_rgb, cmyk_profile_path, intent_name, adjust_strength
+        )
+        orig_de = compute_delta_e(preview_rgb, simulated)
+        orig_stats = compute_warning_stats(orig_de, threshold)
+        adjusted_stats = compute_warning_stats(adjusted_de, threshold)
+
+    # Before/After 統計比較
+    st.markdown("### \u8abf\u6574\u524d\u5f8c\u306e\u6bd4\u8f03")
+    col_b, col_a = st.columns(2)
+    with col_b:
+        st.markdown("**\u8abf\u6574\u524d**")
+        st.metric("\u5e73\u5747 DeltaE", f"{orig_stats['mean_delta_e']:.1f}")
+        st.metric("\u8b66\u544a\u30d4\u30af\u30bb\u30eb", f"{orig_stats['warning_percent']:.1f}%")
+    with col_a:
+        st.markdown("**\u8abf\u6574\u5f8c**")
+        st.metric(
+            "\u5e73\u5747 DeltaE",
+            f"{adjusted_stats['mean_delta_e']:.1f}",
+            delta=f"{adjusted_stats['mean_delta_e'] - orig_stats['mean_delta_e']:.1f}",
+            delta_color="inverse",
+        )
+        st.metric(
+            "\u8b66\u544a\u30d4\u30af\u30bb\u30eb",
+            f"{adjusted_stats['warning_percent']:.1f}%",
+            delta=f"{adjusted_stats['warning_percent'] - orig_stats['warning_percent']:.1f}%",
+            delta_color="inverse",
+        )
+
+    # 画像比較
+    st.markdown("### \u753b\u50cf\u6bd4\u8f03")
+    col_img1, col_img2, col_img3 = st.columns(3)
+    with col_img1:
+        st.caption("Original (RGB)")
+        st.image(preview_rgb, use_container_width=True)
+    with col_img2:
+        st.caption("\u8abf\u6574\u6e08\u307f (RGB)")
+        st.image(adjusted_rgb, use_container_width=True)
+    with col_img3:
+        st.caption("\u8abf\u6574\u6e08\u307f\u306eCMYK\u30b7\u30df\u30e5\u30ec\u30fc\u30b7\u30e7\u30f3")
+        st.image(adjusted_sim, use_container_width=True)
+
+    st.markdown(
+        "> \u300c\u8abf\u6574\u6e08\u307f (RGB)\u300d\u3092\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9\u3057\u3066\u3001"
+        "\u305d\u306e\u30d5\u30a1\u30a4\u30eb\u3092\u5370\u5237\u5165\u7a3f\u3059\u308c\u3070\u3001\u53f3\u306e\u30b7\u30df\u30e5\u30ec\u30fc\u30b7\u30e7\u30f3\u306b\u8fd1\u3044\u8272\u3067\u5370\u5237\u3055\u308c\u307e\u3059\u3002"
+    )
+
+    # 調整済みRGBダウンロード
+    import io
+    buf = io.BytesIO()
+    # オリジナルサイズで調整を実行
+    if adjust_strength > 0:
+        with st.spinner("\u30aa\u30ea\u30b8\u30ca\u30eb\u30b5\u30a4\u30ba\u3067\u8abf\u6574\u4e2d..."):
+            full_adjusted, _, _ = auto_adjust_for_print(
+                original_rgb, cmyk_profile_path, intent_name, adjust_strength
+            )
+            full_adjusted.save(buf, format="PNG")
+    else:
+        original_rgb.save(buf, format="PNG")
+
+    base_name = uploaded_file.name.rsplit(".", 1)[0]
+    st.download_button(
+        label=f"\u2b07\ufe0f {base_name}_adjusted.png \u3092\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9",
+        data=buf.getvalue(),
+        file_name=f"{base_name}_adjusted.png",
+        mime="image/png",
+        type="primary",
     )
 
 with tab_export:

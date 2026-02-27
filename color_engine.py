@@ -171,6 +171,68 @@ def compute_warning_stats(delta_e: np.ndarray, threshold: float) -> dict:
     }
 
 
+def auto_adjust_for_print(
+    image: Image.Image,
+    cmyk_profile_path: Path,
+    intent_name: str = "Perceptual",
+    strength: float = 1.0,
+) -> tuple[Image.Image, Image.Image, np.ndarray]:
+    """
+    色域外のピクセルの彩度を自動調整してCMYK色域内に収める。
+
+    仕組み:
+    1. ソフトプルーフで「CMYK変換後の色」を取得
+    2. 色域外のピクセルを特定（DeltaEが高い箇所）
+    3. そのピクセルの彩度をHSV空間で段階的に下げ、DeltaEが許容範囲に入るまで繰り返す
+    4. 調整済みRGB画像を返す
+
+    Returns: (adjusted_rgb, adjusted_simulated, adjusted_delta_e)
+    """
+    image = image.convert("RGB")
+    orig_arr = np.array(image)
+
+    # ソフトプルーフで色域外を把握
+    simulated = soft_proof(image, cmyk_profile_path, intent_name)
+    delta_e = compute_delta_e(image, simulated)
+
+    # HSV変換
+    hsv_image = image.convert("HSV")
+    hsv_arr = np.array(hsv_image, dtype=np.float64)
+
+    # DeltaEが高いピクセルほど彩度を下げる
+    # 閾値3.0以上を色域外とみなす
+    gamut_threshold = 3.0
+    out_of_gamut = delta_e > gamut_threshold
+
+    if not np.any(out_of_gamut):
+        # 調整不要
+        return image, simulated, delta_e
+
+    # DeltaEに基づいて彩度の削減率を計算
+    # DeltaEが大きいほど彩度を大きく下げる
+    max_de = delta_e.max()
+    if max_de > gamut_threshold:
+        # 0.0（変更なし）〜 1.0（最大削減）にスケーリング
+        reduction = np.clip(
+            (delta_e - gamut_threshold) / (max_de - gamut_threshold), 0.0, 1.0
+        )
+        reduction *= strength  # ユーザー指定の強度
+
+        # 彩度チャンネル（index=1）を削減
+        new_saturation = hsv_arr[:, :, 1] * (1.0 - reduction * 0.7)  # 最大70%削減
+        hsv_arr[:, :, 1] = np.clip(new_saturation, 0, 255)
+
+    # HSV→RGB に戻す
+    adjusted_hsv = Image.fromarray(hsv_arr.astype(np.uint8), "HSV")
+    adjusted_rgb = adjusted_hsv.convert("RGB")
+
+    # 調整後のシミュレーションとDeltaEを計算
+    adjusted_sim = soft_proof(adjusted_rgb, cmyk_profile_path, intent_name)
+    adjusted_de = compute_delta_e(adjusted_rgb, adjusted_sim)
+
+    return adjusted_rgb, adjusted_sim, adjusted_de
+
+
 def export_cmyk(
     image: Image.Image,
     cmyk_profile_path: Path,
