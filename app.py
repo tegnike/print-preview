@@ -15,6 +15,7 @@ from color_engine import (
     INTENTS,
     apply_tone_curves,
     auto_adjust_for_print,
+    auto_optimize,
     compute_delta_e,
     compute_warning_stats,
     create_warning_overlay,
@@ -162,41 +163,92 @@ with tab_adjust:
     @st.fragment
     def adjust_fragment():
         st.subheader("\u8272\u8abf\u6574")
-        st.markdown(
-            "**Step 1**: \u81ea\u52d5\u88dc\u6b63\u3067\u5370\u5237\u8272\u306e\u30ba\u30ec\u3092\u8efd\u6e1b \u2192 "
-            "**Step 2**: \u30c8\u30fc\u30f3\u30ab\u30fc\u30d6\u3067\u5fae\u8abf\u6574"
-        )
 
-        # --- Step 1: 自動補正 ---
-        st.markdown("### Step 1: \u81ea\u52d5\u88dc\u6b63")
-        adjust_strength = st.slider(
-            "\u88dc\u6b63\u306e\u5f37\u3055",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.7,
-            step=0.1,
-            help="CMYK\u5909\u63db\u6642\u306e\u8272\u30ba\u30ec\u3092\u9006\u65b9\u5411\u306b\u88dc\u6b63\u3002\u8d64\u30fb\u7dd1\u30fb\u30aa\u30ec\u30f3\u30b8\u7cfb\u306b\u52b9\u679c\u5927\u3002",
-        )
+        # --- 自動最適化ボタン ---
+        if st.button(
+            "\u2728 \u81ea\u52d5\u6700\u9069\u5316",
+            type="primary",
+            help="\u88dc\u6b63\u5f37\u5ea6\u3068\u30c8\u30fc\u30f3\u30ab\u30fc\u30d6\u3092\u81ea\u52d5\u3067\u6700\u9069\u5024\u306b\u8a2d\u5b9a\u3057\u307e\u3059\u3002\u5c11\u3057\u6642\u9593\u304c\u304b\u304b\u308a\u307e\u3059\u3002",
+        ):
+            progress_bar = st.progress(0, text="\u6700\u9069\u5316\u4e2d...\u88dc\u6b63\u5f37\u5ea6\u3092\u63a2\u7d22")
 
-        with st.spinner("\u81ea\u52d5\u88dc\u6b63\u4e2d..."):
-            adjusted_rgb, adjusted_sim, adjusted_de = auto_adjust_for_print(
-                preview_rgb, cmyk_profile_path, intent_name, adjust_strength
+            def on_progress(pct):
+                if pct < 0.15:
+                    text = "\u6700\u9069\u5316\u4e2d...\u88dc\u6b63\u5f37\u5ea6\u3092\u63a2\u7d22"
+                elif pct < 0.9:
+                    text = "\u6700\u9069\u5316\u4e2d...\u30c8\u30fc\u30f3\u30ab\u30fc\u30d6\u3092\u8abf\u6574"
+                else:
+                    text = "\u6700\u9069\u5316\u4e2d...\u3082\u3046\u3059\u3050\u5b8c\u4e86"
+                progress_bar.progress(min(pct, 1.0), text=text)
+
+            opt_strength, opt_points = auto_optimize(
+                preview_rgb, cmyk_profile_path, intent_name,
+                progress_callback=on_progress,
             )
+            st.session_state["opt_strength"] = opt_strength
+            st.session_state["opt_points"] = opt_points
+            # コンポーネント再作成のためバージョンを更新
+            st.session_state["opt_version"] = st.session_state.get("opt_version", 0) + 1
+            progress_bar.empty()
+            st.rerun(scope="fragment")
 
-        # --- Step 2: トーンカーブ ---
-        st.markdown("### Step 2: \u30c8\u30fc\u30f3\u30ab\u30fc\u30d6")
-        st.caption("\u30dd\u30a4\u30f3\u30c8\u3092\u30c9\u30e9\u30c3\u30b0\u3057\u3066R/G/B\u5404\u30c1\u30e3\u30f3\u30cd\u30eb\u3092\u5fae\u8abf\u6574")
+        # 最適化結果がある場合はそれを初期値に使う
+        default_strength = st.session_state.get("opt_strength", 0.7)
+        default_points = st.session_state.get("opt_points", None)
+        opt_version = st.session_state.get("opt_version", 0)
+
+        # 最適化結果のサマリー表示
+        if default_points:
+            identity = [(0, 0), (64, 64), (128, 128), (192, 192), (255, 255)]
+            opt_channel_points = {
+                ch: [(p[0], p[1]) for p in default_points[ch]]
+                for ch in ["r", "g", "b"]
+            }
+            has_curve_changes = any(
+                opt_channel_points[ch] != identity for ch in ["r", "g", "b"]
+            )
+            summary_parts = [f"\u88dc\u6b63\u5f37\u5ea6: **{default_strength}**"]
+            if has_curve_changes:
+                for ch, label in [("r", "R"), ("g", "G"), ("b", "B")]:
+                    pts = opt_channel_points[ch]
+                    changes = []
+                    for i, (inp, out) in enumerate(pts):
+                        if inp != out:
+                            names = ["Black", "Shadow", "Mid", "Highlight", "White"]
+                            changes.append(f"{names[i]} {inp}\u2192{out}")
+                    if changes:
+                        summary_parts.append(f"{label}: {', '.join(changes)}")
+            else:
+                summary_parts.append("\u30c8\u30fc\u30f3\u30ab\u30fc\u30d6: \u5909\u66f4\u306a\u3057\uff08\u30ea\u30cb\u30a2\u304c\u6700\u9069\uff09")
+            st.info("\u2728 \u6700\u9069\u5316\u7d50\u679c: " + " / ".join(summary_parts))
+
+        st.markdown(
+            "**Step 1**: \u30c8\u30fc\u30f3\u30ab\u30fc\u30d6\u3067\u8272\u57df\u88dc\u6b63 \u2192 "
+            "**Step 2**: \u81ea\u52d5\u88dc\u6b63\u3067\u30d4\u30af\u30bb\u30eb\u5358\u4f4d\u306e\u5fae\u8abf\u6574"
+        )
+
+        # --- Step 1: トーンカーブ ---
+        st.markdown("### Step 1: \u30c8\u30fc\u30f3\u30ab\u30fc\u30d6")
+        st.caption("\u30dd\u30a4\u30f3\u30c8\u3092\u30c9\u30e9\u30c3\u30b0\u3057\u3066R/G/B\u5404\u30c1\u30e3\u30f3\u30cd\u30eb\u3092\u8abf\u6574\u3001\u307e\u305f\u306f\u300c\u81ea\u52d5\u6700\u9069\u5316\u300d\u3067\u81ea\u52d5\u8a2d\u5b9a")
 
         # カスタムインタラクティブトーンカーブ
-        identity_points = {
-            "r": [[0, 0], [64, 64], [128, 128], [192, 192], [255, 255]],
-            "g": [[0, 0], [64, 64], [128, 128], [192, 192], [255, 255]],
-            "b": [[0, 0], [64, 64], [128, 128], [192, 192], [255, 255]],
-        }
+        if default_points:
+            init_points = {
+                ch: [list(p) for p in default_points[ch]]
+                for ch in ["r", "g", "b"]
+            }
+        else:
+            init_points = {
+                "r": [[0, 0], [64, 64], [128, 128], [192, 192], [255, 255]],
+                "g": [[0, 0], [64, 64], [128, 128], [192, 192], [255, 255]],
+                "b": [[0, 0], [64, 64], [128, 128], [192, 192], [255, 255]],
+            }
+
+        # opt_versionをkeyに含めて最適化後にコンポーネントを再作成
         curve_result = _tone_curve_component(
-            channel_points=identity_points,
-            key="tone_curve_editor",
-            default=identity_points,
+            channel_points=init_points,
+            key=f"tone_curve_editor_{opt_version}",
+            default=init_points,
         )
 
         # コンポーネントの結果をタプルリストに変換
@@ -207,27 +259,42 @@ with tab_adjust:
             }
         else:
             channel_points = {
-                ch: [(p[0], p[1]) for p in identity_points[ch]]
+                ch: [(p[0], p[1]) for p in init_points[ch]]
                 for ch in ["r", "g", "b"]
             }
 
         # カーブが変更されているか判定
+        identity = [(0, 0), (64, 64), (128, 128), (192, 192), (255, 255)]
         curve_is_identity = all(
-            channel_points[ch] == [(0, 0), (64, 64), (128, 128), (192, 192), (255, 255)]
+            channel_points[ch] == identity
             for ch in ["r", "g", "b"]
         )
 
-        # --- 自動補正 + トーンカーブ結合 ---
+        # トーンカーブを元画像に適用
         if curve_is_identity:
-            # トーンカーブ未調整 → 自動補正のみ
-            final_rgb = adjusted_rgb
+            curved_rgb = preview_rgb
         else:
-            # 自動補正結果にトーンカーブを重ねがけ
-            final_rgb = apply_tone_curves(
-                adjusted_rgb,
+            curved_rgb = apply_tone_curves(
+                preview_rgb,
                 r_points=channel_points["r"],
                 g_points=channel_points["g"],
                 b_points=channel_points["b"],
+            )
+
+        # --- Step 2: 自動補正 ---
+        st.markdown("### Step 2: \u81ea\u52d5\u88dc\u6b63")
+        adjust_strength = st.slider(
+            "\u88dc\u6b63\u306e\u5f37\u3055",
+            min_value=0.0,
+            max_value=1.0,
+            value=default_strength,
+            step=0.1,
+            help="CMYK\u5909\u63db\u6642\u306e\u8272\u30ba\u30ec\u3092\u9006\u65b9\u5411\u306b\u88dc\u6b63\u3002\u8d64\u30fb\u7dd1\u30fb\u30aa\u30ec\u30f3\u30b8\u7cfb\u306b\u52b9\u679c\u5927\u3002",
+        )
+
+        with st.spinner("\u81ea\u52d5\u88dc\u6b63\u4e2d..."):
+            final_rgb, _, _ = auto_adjust_for_print(
+                curved_rgb, cmyk_profile_path, intent_name, adjust_strength
             )
 
         # 最終結果のシミュレーション
@@ -246,7 +313,7 @@ with tab_adjust:
             st.metric("\u5e73\u5747 DeltaE", f"{orig_stats['mean_delta_e']:.1f}")
             st.metric("\u8b66\u544a\u30d4\u30af\u30bb\u30eb", f"{orig_stats['warning_percent']:.1f}%")
         with col_a:
-            label = "**\u81ea\u52d5\u88dc\u6b63 + \u30ab\u30fc\u30d6**" if not curve_is_identity else "**\u81ea\u52d5\u88dc\u6b63\u5f8c**"
+            label = "**\u30ab\u30fc\u30d6 + \u81ea\u52d5\u88dc\u6b63**" if not curve_is_identity else "**\u81ea\u52d5\u88dc\u6b63\u5f8c**"
             st.markdown(label)
             st.metric(
                 "\u5e73\u5747 DeltaE",
@@ -285,22 +352,25 @@ with tab_adjust:
             with st.spinner(
                 f"\u30aa\u30ea\u30b8\u30ca\u30eb\u30b5\u30a4\u30ba ({original_rgb.size[0]}x{original_rgb.size[1]}) \u3067\u51e6\u7406\u4e2d..."
             ):
-                full_adjusted, _, _ = auto_adjust_for_print(
-                    original_rgb, cmyk_profile_path, intent_name, adjust_strength
-                )
+                # パイプライン: トーンカーブ → 自動補正
                 if not curve_is_identity:
-                    full_adjusted = apply_tone_curves(
-                        full_adjusted,
+                    full_curved = apply_tone_curves(
+                        original_rgb,
                         r_points=channel_points["r"],
                         g_points=channel_points["g"],
                         b_points=channel_points["b"],
                     )
+                else:
+                    full_curved = original_rgb
+                full_adjusted, _, _ = auto_adjust_for_print(
+                    full_curved, cmyk_profile_path, intent_name, adjust_strength
+                )
                 buf = io.BytesIO()
                 full_adjusted.save(buf, format="PNG")
                 st.session_state["adjusted_data"] = buf.getvalue()
                 st.session_state["adjusted_filename"] = f"{base_name}_adjusted.png"
             st.success("\u5b8c\u4e86\uff01\u4e0b\u306e\u30dc\u30bf\u30f3\u304b\u3089\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9\u3067\u304d\u307e\u3059\u3002")
-            st.rerun()
+            st.rerun(scope="fragment")
 
         if "adjusted_data" in st.session_state:
             st.download_button(

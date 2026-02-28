@@ -10,6 +10,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageCms
+from scipy.optimize import minimize
 
 # システムICCプロファイルパス
 SYSTEM_PROFILES_DIR = Path("/System/Library/ColorSync/Profiles")
@@ -68,7 +69,11 @@ def soft_proof(
         outMode="RGB",
         renderingIntent=ImageCms.Intent.PERCEPTUAL,
         proofRenderingIntent=proof_intent,
-        flags=ImageCms.Flags.SOFTPROOFING,
+        flags=(
+            ImageCms.Flags.SOFTPROOFING
+            | ImageCms.Flags.BLACKPOINTCOMPENSATION
+            | ImageCms.Flags.HIGHRESPRECALC
+        ),
     )
 
     simulated = image.copy()
@@ -201,9 +206,9 @@ def auto_adjust_for_print(
 
     adjusted_arr = orig_arr.copy()
 
-    # 反復逆補正（3回固定、減衰あり）
-    for i in range(3):
-        damping = strength * (0.8 ** i)  # 反復ごとに減衰
+    # 反復逆補正（6回、減衰あり）
+    for i in range(6):
+        damping = strength * (0.7 ** i)  # 反復ごとに減衰
 
         current_img = Image.fromarray(
             np.clip(adjusted_arr, 0, 255).astype(np.uint8)
@@ -289,6 +294,224 @@ def apply_tone_curves(
     arr[:, :, 2] = b_lut[arr[:, :, 2]]
 
     return Image.fromarray(arr)
+
+
+def _compute_delta_e_2000(lab1: np.ndarray, lab2: np.ndarray) -> np.ndarray:
+    """
+    CIEDE2000 色差をベクトル化計算（CIE76より知覚的に正確）。
+    lab1, lab2: shape (H, W, 3) の Lab 配列
+    Returns: shape (H, W) の DeltaE2000 配列
+    """
+    L1, a1, b1 = lab1[..., 0], lab1[..., 1], lab1[..., 2]
+    L2, a2, b2 = lab2[..., 0], lab2[..., 1], lab2[..., 2]
+
+    C1 = np.sqrt(a1**2 + b1**2)
+    C2 = np.sqrt(a2**2 + b2**2)
+    C_avg = (C1 + C2) / 2.0
+    C_avg7 = C_avg**7
+    G = 0.5 * (1.0 - np.sqrt(C_avg7 / (C_avg7 + 25.0**7)))
+
+    a1p = a1 * (1.0 + G)
+    a2p = a2 * (1.0 + G)
+    C1p = np.sqrt(a1p**2 + b1**2)
+    C2p = np.sqrt(a2p**2 + b2**2)
+
+    h1p = np.degrees(np.arctan2(b1, a1p)) % 360
+    h2p = np.degrees(np.arctan2(b2, a2p)) % 360
+
+    dLp = L2 - L1
+    dCp = C2p - C1p
+
+    dhp_cond1 = np.abs(h2p - h1p) <= 180
+    dhp_cond2 = h2p - h1p > 180
+    dhp = np.where(
+        C1p * C2p == 0, 0.0,
+        np.where(dhp_cond1, h2p - h1p,
+                 np.where(dhp_cond2, h2p - h1p - 360, h2p - h1p + 360))
+    )
+    dHp = 2.0 * np.sqrt(C1p * C2p) * np.sin(np.radians(dhp / 2.0))
+
+    Lp_avg = (L1 + L2) / 2.0
+    Cp_avg = (C1p + C2p) / 2.0
+
+    hp_sum = h1p + h2p
+    hp_abs_diff = np.abs(h1p - h2p)
+    both_nonzero = (C1p * C2p) != 0
+
+    Hp_avg = np.where(
+        ~both_nonzero, hp_sum,
+        np.where(hp_abs_diff <= 180, hp_sum / 2.0,
+                 np.where(hp_sum < 360, (hp_sum + 360) / 2.0, (hp_sum - 360) / 2.0))
+    )
+
+    T = (1.0
+         - 0.17 * np.cos(np.radians(Hp_avg - 30))
+         + 0.24 * np.cos(np.radians(2 * Hp_avg))
+         + 0.32 * np.cos(np.radians(3 * Hp_avg + 6))
+         - 0.20 * np.cos(np.radians(4 * Hp_avg - 63)))
+
+    SL = 1.0 + 0.015 * (Lp_avg - 50)**2 / np.sqrt(20 + (Lp_avg - 50)**2)
+    SC = 1.0 + 0.045 * Cp_avg
+    SH = 1.0 + 0.015 * Cp_avg * T
+
+    Cp_avg7 = Cp_avg**7
+    RT = (-np.sin(2.0 * np.radians(60.0 * np.exp(-((Hp_avg - 275) / 25.0)**2)))
+          * 2.0 * np.sqrt(Cp_avg7 / (Cp_avg7 + 25.0**7)))
+
+    dE = np.sqrt(
+        (dLp / SL)**2
+        + (dCp / SC)**2
+        + (dHp / SH)**2
+        + RT * (dCp / SC) * (dHp / SH)
+    )
+    return dE
+
+
+def auto_optimize(
+    image: Image.Image,
+    cmyk_profile_path: Path,
+    intent_name: str = "Perceptual",
+    progress_callback=None,
+) -> tuple[float, dict[str, list[tuple[int, int]]]]:
+    """
+    トーンカーブと自動補正強度を自動最適化してDeltaEを最小化。
+
+    パイプライン: 元画像 → トーンカーブ → 自動補正 → CMYK変換
+
+    Phase 1: Nelder-Mead法でトーンカーブ9パラメータを最適化（CIEDE2000評価）
+    Phase 2: 最適カーブ適用後の画像に対して自動補正強度を探索
+
+    Returns: (best_strength, best_channel_points)
+    """
+    # 最適化用に画像を縮小（高速化）
+    OPT_SIZE = 400
+    w, h = image.size
+    if max(w, h) > OPT_SIZE:
+        ratio = OPT_SIZE / max(w, h)
+        opt_img = image.resize(
+            (int(w * ratio), int(h * ratio)), Image.LANCZOS
+        )
+    else:
+        opt_img = image.copy()
+
+    opt_img = opt_img.convert("RGB")
+    opt_arr = np.array(opt_img)
+    orig_lab = _srgb_to_lab(opt_arr)
+
+    eval_count = [0]
+
+    def report_phase1(x):
+        """Nelder-Meadのコールバック（反復ごと）"""
+        eval_count[0] += 1
+        if progress_callback:
+            # Phase 1 は全体の 70%
+            progress_callback(min(0.7, eval_count[0] / 200 * 0.7))
+
+    # --- Phase 1: Nelder-Mead法でトーンカーブ最適化 ---
+    def objective(params_flat):
+        """9パラメータ → トーンカーブ適用 → soft_proof → CIEDE2000平均"""
+        params_int = np.clip(np.round(params_flat), 0, 255).astype(int)
+        params_dict = {
+            "r": [int(params_int[0]), int(params_int[1]), int(params_int[2])],
+            "g": [int(params_int[3]), int(params_int[4]), int(params_int[5])],
+            "b": [int(params_int[6]), int(params_int[7]), int(params_int[8])],
+        }
+        ch_points = _params_to_channel_points(params_dict)
+        curved = apply_tone_curves(
+            opt_img,
+            r_points=ch_points["r"],
+            g_points=ch_points["g"],
+            b_points=ch_points["b"],
+        )
+        sim = soft_proof(curved, cmyk_profile_path, intent_name)
+        sim_lab = _srgb_to_lab(np.array(sim))
+        # CIEDE2000で評価（知覚的に正確）
+        de2000 = _compute_delta_e_2000(orig_lab, sim_lab)
+        # 平均 + 95パーセンタイルの重み付き（外れ値も考慮）
+        mean_de = float(np.mean(de2000))
+        p95_de = float(np.percentile(de2000, 95))
+        return 0.7 * mean_de + 0.3 * p95_de
+
+    # 初期値: identity curve (shadow=64, mid=128, highlight=192)
+    x0 = np.array([64, 128, 192, 64, 128, 192, 64, 128, 192], dtype=float)
+
+    result = minimize(
+        objective,
+        x0,
+        method="Nelder-Mead",
+        callback=report_phase1,
+        options={
+            "maxiter": 300,
+            "maxfev": 500,
+            "xatol": 1.0,
+            "fatol": 0.01,
+            "adaptive": True,
+        },
+    )
+
+    best_params = np.clip(np.round(result.x), 0, 255).astype(int)
+    params = {
+        "r": [int(best_params[0]), int(best_params[1]), int(best_params[2])],
+        "g": [int(best_params[3]), int(best_params[4]), int(best_params[5])],
+        "b": [int(best_params[6]), int(best_params[7]), int(best_params[8])],
+    }
+    best_channel_points = _params_to_channel_points(params)
+
+    if progress_callback:
+        progress_callback(0.7)
+
+    # --- Phase 2: 最適カーブ適用後の画像で自動補正強度を探索 ---
+    curve_is_identity = all(
+        params[ch] == [64, 128, 192] for ch in ["r", "g", "b"]
+    )
+    if curve_is_identity:
+        curved_img = opt_img
+    else:
+        curved_img = apply_tone_curves(
+            opt_img,
+            r_points=best_channel_points["r"],
+            g_points=best_channel_points["g"],
+            b_points=best_channel_points["b"],
+        )
+
+    best_strength = 0.0
+    best_mean_de = float("inf")
+
+    strengths = np.arange(0.0, 1.05, 0.1)
+    for i, strength in enumerate(strengths):
+        strength = round(strength, 1)
+        adj, _, _ = auto_adjust_for_print(
+            curved_img, cmyk_profile_path, intent_name, strength
+        )
+        sim = soft_proof(adj, cmyk_profile_path, intent_name)
+        sim_lab = _srgb_to_lab(np.array(sim))
+        de2000 = _compute_delta_e_2000(orig_lab, sim_lab)
+        mean_de = float(np.mean(de2000))
+
+        if mean_de < best_mean_de:
+            best_mean_de = mean_de
+            best_strength = strength
+
+        if progress_callback:
+            progress_callback(0.7 + 0.3 * (i + 1) / len(strengths))
+
+    return best_strength, best_channel_points
+
+
+def _params_to_channel_points(
+    params: dict[str, list[int]],
+) -> dict[str, list[tuple[int, int]]]:
+    """最適化パラメータ → channel_points変換"""
+    result = {}
+    for ch in ["r", "g", "b"]:
+        result[ch] = [
+            (0, 0),
+            (64, params[ch][0]),
+            (128, params[ch][1]),
+            (192, params[ch][2]),
+            (255, 255),
+        ]
+    return result
 
 
 def export_cmyk(
